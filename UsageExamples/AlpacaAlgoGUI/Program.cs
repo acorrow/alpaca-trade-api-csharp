@@ -3,8 +3,9 @@ using System.Threading.Tasks;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.DependencyInjection;
 using Terminal.Gui;
+using UsageExamples;
 
-class Program
+partial class Program
 {
     // These MUST remain static because serviceProvider is static and is used to create these instances
     static IServiceProvider serviceProvider;
@@ -30,10 +31,16 @@ class Program
 
         // Add a button to start/stop the algorithm
         var startButton = new Button("Start Algorithm") { X = 1, Y = 1 };
+        var statusLabel = new Label("Algorithm Status: Stopped") { X = 1, Y = 3 };
+
         startButton.Clicked += async () =>
         {
             if (!algorithmRunning)
             {
+                algorithmRunning = true;
+                startButton.Text = "Stop Algorithm";
+                statusLabel.Text = "Algorithm Status: Running";
+
                 meanReversionWithCrypto = serviceProvider.GetRequiredService<MeanReversionWithCrypto>();
                 cancellationTokenSource = new CancellationTokenSource();
 
@@ -45,13 +52,13 @@ class Program
                 catch (Exception ex)
                 {
                     logger.LogError(ex, "An error occurred in the algorithm.");
-                    //Consider more sophisticated error handling here, maybe display error in GUI
                 }
                 finally
                 {
                     cancellationTokenSource.Dispose();
-                    algorithmRunning = false; // Ensure this is set to false even on exceptions
-                    startButton.Text = "Start Algorithm"; // Update button text in finally block
+                    algorithmRunning = false;
+                    startButton.Text = "Start Algorithm";
+                    statusLabel.Text = "Algorithm Status: Stopped";
                 }
             }
             else
@@ -59,11 +66,9 @@ class Program
                 cancellationTokenSource?.Cancel();
                 algorithmRunning = false;
                 startButton.Text = "Start Algorithm";
+                statusLabel.Text = "Algorithm Status: Stopped";
             }
         };
-
-        // Add a basic status display area
-        var statusLabel = new Label("Algorithm Status: Stopped") { X = 1, Y = 3 };
 
         win.Add(startButton, statusLabel);
         Application.Run();

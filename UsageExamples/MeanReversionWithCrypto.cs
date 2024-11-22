@@ -21,26 +21,28 @@ namespace UsageExamples;
 [JsonSerializable(typeof(List<Decimal>))]
 internal sealed partial class MeanReversionWithCryptoJsonContext : JsonSerializerContext
 {
-    public MeanReversionWithCryptoJsonContext() : base(new JsonSerializerOptions
-    {
-        DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull,
-        PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
-        WriteIndented = true
-    })
-    {
-    }
+    // Remove the manually defined constructor
+    // public MeanReversionWithCryptoJsonContext() : base(new JsonSerializerOptions
+    // {
+    //     DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull,
+    //     PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
+    //     WriteIndented = true
+    // })
+    // {
+    // }
 
-    public override JsonTypeInfo GetTypeInfo(Type type)
-    {
-        if (type == typeof(List<Decimal>))
-        {
-            return MeanReversionWithCryptoJsonContext.Default.ListDecimal;
-        }
-        throw new NotSupportedException($"Type '{type}' is not supported by this context.");
-    }
+    // Remove the manually defined GetTypeInfo method
+    // public override JsonTypeInfo GetTypeInfo(Type type)
+    // {
+    //     if (type == typeof(List<Decimal>))
+    //     {
+    //         return MeanReversionWithCryptoJsonContext.Default.ListDecimal;
+    //     }
+    //     throw new NotSupportedException($"Type '{type}' is not supported by this context.");
+    // }
 }
 
-internal sealed class MeanReversionWithCrypto : IDisposable
+public sealed class MeanReversionWithCrypto : IDisposable
 {
     private const String API_KEY = "REPLACEME";
     private const String API_SECRET = "REPLACEME";
@@ -129,7 +131,7 @@ internal sealed class MeanReversionWithCrypto : IDisposable
         {
             logger.LogInformation("Operation canceled.");
         }
-        catch (AlpacaRestException ex)
+        catch (RestClientErrorException ex) // Update exception type
         {
             logger.LogError(ex, "Alpaca REST API error occurred while running the mean reversion strategy.");
         }
@@ -164,7 +166,7 @@ internal sealed class MeanReversionWithCrypto : IDisposable
                 logger.LogInformation("Connection attempt canceled.");
                 throw;
             }
-            catch (AlpacaRestException ex)
+            catch (RestClientErrorException ex) // Update exception type
             {
                 attempt++;
                 logger.LogError(ex, "Connection ID {ConnectionId}: Alpaca REST API error while connecting to streaming client for symbol {Symbol} at {Time}. Attempt {Attempt} of {MaxAttempts}. Retrying in {Delay} seconds...", connectionId, symbol, DateTime.UtcNow, attempt, maxRetryAttempts, delay.TotalSeconds);
@@ -221,7 +223,7 @@ internal sealed class MeanReversionWithCrypto : IDisposable
         {
             logger.LogInformation("Market open wait canceled.");
         }
-        catch (AlpacaRestException ex)
+        catch (RestClientErrorException ex) // Update exception type
         {
             logger.LogError(ex, "Alpaca REST API error occurred while waiting for the market to open.");
         }
@@ -329,7 +331,7 @@ internal sealed class MeanReversionWithCrypto : IDisposable
             {
                 logger.LogInformation("Canceling last trade order canceled.");
             }
-            catch (AlpacaRestException ex)
+            catch (RestClientErrorException ex) // Update exception type
             {
                 logger.LogError(ex, "Alpaca REST API error occurred while canceling the last trade order.");
             }
@@ -356,7 +358,7 @@ internal sealed class MeanReversionWithCrypto : IDisposable
         {
             logger.LogInformation("Getting current position canceled.");
         }
-        catch (AlpacaRestException ex)
+        catch (RestClientErrorException ex) // Update exception type
         {
             logger.LogError(ex, "Alpaca REST API error occurred while getting the current position.");
         }
@@ -501,7 +503,7 @@ internal sealed class MeanReversionWithCrypto : IDisposable
         {
             logger.LogInformation("Submitting order canceled.");
         }
-        catch (AlpacaRestException ex)
+        catch (RestClientErrorException ex) // Update exception type
         {
             logger.LogError(ex, "Alpaca REST API error occurred while submitting an order.");
         }
@@ -534,7 +536,7 @@ internal sealed class MeanReversionWithCrypto : IDisposable
             {
                 logger.LogInformation("Closing position at market canceled.");
             }
-            catch (AlpacaRestException ex)
+            catch (RestClientErrorException ex) // Update exception type
             {
                 logger.LogError(ex, "Alpaca REST API error occurred while closing the position at market.");
             }
