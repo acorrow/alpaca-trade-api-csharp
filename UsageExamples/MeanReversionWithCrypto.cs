@@ -1,5 +1,11 @@
 ﻿using Alpaca.Markets;
 using System.Diagnostics.CodeAnalysis;
+using Microsoft.Extensions.Configuration;
+using Microsoft.Extensions.Logging;
+using System.Text.Json;
+using System.Text.Json.Serialization;
+using System.Text.Json.Serialization.Metadata;
+using System.Threading;
 
 namespace UsageExamples;
 
@@ -12,133 +18,258 @@ namespace UsageExamples;
 [SuppressMessage("ReSharper", "InconsistentNaming")]
 [SuppressMessage("ReSharper", "UnusedMember.Global")]
 [SuppressMessage("ReSharper", "RedundantDefaultMemberInitializer")]
+[JsonSerializable(typeof(List<Decimal>))]
+internal sealed partial class MeanReversionWithCryptoJsonContext : JsonSerializerContext
+{
+    public MeanReversionWithCryptoJsonContext() : base(new JsonSerializerOptions
+    {
+        DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull,
+        PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
+        WriteIndented = true
+    })
+    {
+    }
+
+    public override JsonTypeInfo GetTypeInfo(Type type)
+    {
+        if (type == typeof(List<Decimal>))
+        {
+            return MeanReversionWithCryptoJsonContext.Default.ListDecimal;
+        }
+        throw new NotSupportedException($"Type '{type}' is not supported by this context.");
+    }
+}
+
 internal sealed class MeanReversionWithCrypto : IDisposable
 {
     private const String API_KEY = "REPLACEME";
-
     private const String API_SECRET = "REPLACEME";
-
-    private const String symbol = "BTCUSD";
-
+    private static readonly IConfiguration config = new ConfigurationBuilder()
+        .AddJsonFile("appsettings.json", optional: false, reloadOnChange: true)
+        .Build();
+    private static readonly String[] symbols = config.GetSection("Symbols").GetChildren().Select(x => x.Value).ToArray();
+    private static readonly Decimal blockSize = Decimal.Parse(config["BlockSize"] ?? "10");
     private const Decimal scale = 200;
+    private const int maxRetryAttempts = 5;
+    private static readonly TimeSpan initialDelay = TimeSpan.FromSeconds(5);
+    private const string closingPricesFilePath = "closingPrices.json";
+    private static readonly Mutex fileMutex = new Mutex(false, "MeanReversionWithCryptoFileMutex");
 
     private IAlpacaCryptoDataClient alpacaCryptoDataClient;
-
     private IAlpacaTradingClient alpacaTradingClient;
-
     private IAlpacaStreamingClient alpacaStreamingClient;
-
     private IAlpacaCryptoStreamingClient alpacaCryptoStreamingClient;
+    private readonly ILogger<MeanReversionWithCrypto> logger;
 
     private Guid lastTradeId = Guid.NewGuid();
-
     private Boolean lastTradeOpen;
-
-    private readonly List<Decimal> closingPrices = [];
-
+    private readonly List<Decimal> closingPrices = new();
     private Boolean isAssetShortable;
 
-    public async Task Run()
+    public MeanReversionWithCrypto(ILogger<MeanReversionWithCrypto> logger)
     {
-        alpacaTradingClient = Environments.Paper.GetAlpacaTradingClient(new SecretKey(API_KEY, API_SECRET));
+        this.logger = logger;
+    }
 
-        alpacaCryptoDataClient = Environments.Paper.GetAlpacaCryptoDataClient(new SecretKey(API_KEY, API_SECRET));
-
-        // Connect to Alpaca's websocket and listen for updates on our orders.
-        alpacaStreamingClient = Environments.Paper.GetAlpacaStreamingClient(new SecretKey(API_KEY, API_SECRET));
-
-        await alpacaStreamingClient.ConnectAndAuthenticateAsync();
-
-        alpacaStreamingClient.OnTradeUpdate += HandleTradeUpdate;
-
-        var asset = await alpacaTradingClient.GetAssetAsync(symbol);
-        isAssetShortable = asset.Shortable;
-
-        // First, cancel any existing orders so they don't impact our buying power.
-        await alpacaTradingClient.CancelAllOrdersAsync();
-
-        // Figure out when the market will close so we can prepare to sell beforehand.
-        var calendars = (await alpacaTradingClient
-            .ListIntervalCalendarAsync(new CalendarRequest().WithInterval(DateTime.Today.GetIntervalFromThat())))
-            .ToList();
-        var calendarDate = calendars.First().GetTradingDate();
-        var closingTime = calendars.First().GetTradingCloseTimeUtc();
-
-        closingTime = new DateTime(calendarDate.Year, calendarDate.Month, calendarDate.Day, closingTime.Hour, closingTime.Minute, closingTime.Second);
-
-        // Get the first group of bars from today if the market has already been open.
-        var today = DateTime.Today;
-        var calendar = await alpacaTradingClient.ListIntervalCalendarAsync(
-            CalendarRequest.GetForSingleDay(DateOnly.FromDateTime(today)));
-        var tradingDay = calendar[0];
-
-        var bars = await alpacaCryptoDataClient.ListHistoricalBarsAsync(
-            new HistoricalCryptoBarsRequest(symbol, BarTimeFrame.Minute, tradingDay.Trading));
-        var lastBars = bars.Items.Skip(Math.Max(0, bars.Items.Count - 20));
-
-        foreach (var bar in lastBars)
+    public async Task run(CancellationToken cancellationToken)
+    {
+        try
         {
-            if (bar.TimeUtc.Date == today)
+            alpacaTradingClient = Environments.Paper.GetAlpacaTradingClient(new SecretKey(API_KEY, API_SECRET));
+            alpacaCryptoDataClient = Environments.Paper.GetAlpacaCryptoDataClient(new SecretKey(API_KEY, API_SECRET));
+            alpacaStreamingClient = Environments.Paper.GetAlpacaStreamingClient(new SecretKey(API_KEY, API_SECRET));
+
+            await alpacaStreamingClient.ConnectAndAuthenticateAsync(cancellationToken);
+            alpacaStreamingClient.OnTradeUpdate += handleTradeUpdate;
+
+            foreach (var symbol in symbols)
             {
-                closingPrices.Add(bar.Close);
+                if (cancellationToken.IsCancellationRequested)
+                {
+                    logger.LogInformation("Cancellation requested. Exiting run method.");
+                    return;
+                }
+
+                var asset = await alpacaTradingClient.GetAssetAsync(symbol, cancellationToken);
+                isAssetShortable = asset.Shortable;
+
+                await alpacaTradingClient.CancelAllOrdersAsync(cancellationToken);
+
+                var today = DateTime.Today;
+                var calendar = await alpacaTradingClient.ListIntervalCalendarAsync(
+                    CalendarRequest.GetForSingleDay(DateOnly.FromDateTime(today)), cancellationToken);
+                var tradingDay = calendar[0];
+
+                var bars = await alpacaCryptoDataClient.ListHistoricalBarsAsync(
+                    new HistoricalCryptoBarsRequest(symbol, BarTimeFrame.Minute, tradingDay.Trading), cancellationToken);
+                var lastBars = bars.Items.Skip(Math.Max(0, bars.Items.Count - 20));
+
+                foreach (var bar in lastBars)
+                {
+                    if (bar.TimeUtc.Date == today)
+                    {
+                        closingPrices.Add(bar.Close);
+                    }
+                }
+
+                Console.WriteLine("Waiting for market open...");
+                await awaitMarketOpen(cancellationToken);
+                Console.WriteLine("Market opened.");
+
+                alpacaCryptoStreamingClient = Environments.Live.GetAlpacaCryptoStreamingClient(new SecretKey(API_KEY, API_SECRET));
+
+                await connectWithRetryAsync(symbol, cancellationToken);
+
+                var subscription = alpacaCryptoStreamingClient.GetMinuteBarSubscription(symbol);
+                subscription.Received += async bar => await handleMinuteBar(bar, symbol, cancellationToken);
+                await alpacaCryptoStreamingClient.SubscribeAsync(subscription, cancellationToken);
             }
         }
-
-        Console.WriteLine("Waiting for market open...");
-        await AwaitMarketOpen();
-        Console.WriteLine("Market opened.");
-
-        // Connect to Alpaca's websocket and listen for price updates.
-        alpacaCryptoStreamingClient = Environments.Live.GetAlpacaCryptoStreamingClient(new SecretKey(API_KEY, API_SECRET));
-
-        await alpacaCryptoStreamingClient.ConnectAndAuthenticateAsync();
-        Console.WriteLine("Alpaca streaming client opened.");
-
-        var subscription = alpacaCryptoStreamingClient.GetMinuteBarSubscription(symbol);
-        // ReSharper disable once AsyncVoidLambda
-        subscription.Received += async bar =>
+        catch (OperationCanceledException)
         {
-                // If the market's close to closing, exit position and stop trading.
-                var minutesUntilClose = closingTime - DateTime.UtcNow;
-            if (minutesUntilClose.TotalMinutes < 15)
+            logger.LogInformation("Operation canceled.");
+        }
+        catch (AlpacaRestException ex)
+        {
+            logger.LogError(ex, "Alpaca REST API error occurred while running the mean reversion strategy.");
+        }
+        catch (Exception ex)
+        {
+            logger.LogError(ex, "An unexpected error occurred while running the mean reversion strategy.");
+        }
+        finally
+        {
+            await closePositionAtMarket(cancellationToken);
+            Dispose();
+        }
+    }
+
+    private async Task connectWithRetryAsync(string symbol, CancellationToken cancellationToken)
+    {
+        int attempt = 0;
+        TimeSpan delay = initialDelay;
+        var connectionId = Guid.NewGuid();
+
+        while (attempt < maxRetryAttempts)
+        {
+            try
             {
-                Console.WriteLine("Reached the end of trading window.");
-                await ClosePositionAtMarket();
-                await alpacaCryptoStreamingClient.DisconnectAsync();
+                logger.LogInformation("Connection ID {ConnectionId}: Attempting to connect to Alpaca streaming client for symbol {Symbol} at {Time}. Attempt {Attempt} of {MaxAttempts}.", connectionId, symbol, DateTime.UtcNow, attempt + 1, maxRetryAttempts);
+                await alpacaCryptoStreamingClient.ConnectAndAuthenticateAsync(cancellationToken);
+                logger.LogInformation("Connection ID {ConnectionId}: Successfully connected to Alpaca streaming client for symbol {Symbol} at {Time}.", connectionId, symbol, DateTime.UtcNow);
+                return;
             }
-            else
+            catch (OperationCanceledException)
             {
-                    // Decide whether to buy or sell and submit orders.
-                    await HandleMinuteBar(bar);
+                logger.LogInformation("Connection attempt canceled.");
+                throw;
             }
-        };
-        await alpacaCryptoStreamingClient.SubscribeAsync(subscription);
+            catch (AlpacaRestException ex)
+            {
+                attempt++;
+                logger.LogError(ex, "Connection ID {ConnectionId}: Alpaca REST API error while connecting to streaming client for symbol {Symbol} at {Time}. Attempt {Attempt} of {MaxAttempts}. Retrying in {Delay} seconds...", connectionId, symbol, DateTime.UtcNow, attempt, maxRetryAttempts, delay.TotalSeconds);
+                if (attempt >= maxRetryAttempts)
+                {
+                    logger.LogError("Connection ID {ConnectionId}: Max retry attempts reached. Unable to connect to Alpaca streaming client for symbol {Symbol} at {Time}.", connectionId, symbol, DateTime.UtcNow);
+                    throw;
+                }
+                await Task.Delay(delay, cancellationToken);
+                delay = TimeSpan.FromSeconds(delay.TotalSeconds * 2); // Exponential backoff
+            }
+            catch (Exception ex)
+            {
+                attempt++;
+                logger.LogError(ex, "Connection ID {ConnectionId}: Unexpected error while connecting to streaming client for symbol {Symbol} at {Time}. Attempt {Attempt} of {MaxAttempts}. Retrying in {Delay} seconds...", connectionId, symbol, DateTime.UtcNow, attempt, maxRetryAttempts, delay.TotalSeconds);
+                if (attempt >= maxRetryAttempts)
+                {
+                    logger.LogError("Connection ID {ConnectionId}: Max retry attempts reached. Unable to connect to Alpaca streaming client for symbol {Symbol} at {Time}.", connectionId, symbol, DateTime.UtcNow);
+                    throw;
+                }
+                await Task.Delay(delay, cancellationToken);
+                delay = TimeSpan.FromSeconds(delay.TotalSeconds * 2); // Exponential backoff
+            }
+        }
     }
 
     public void Dispose()
     {
-        alpacaTradingClient?.Dispose();
-        alpacaCryptoDataClient?.Dispose();
-        alpacaStreamingClient?.Dispose();
-        alpacaCryptoStreamingClient?.Dispose();
+        dispose(true);
+        GC.SuppressFinalize(this);
     }
 
-    // Waits until the clock says the market is open.
-    // Note: if you wanted the algorithm to start trading right at market open, you would instead
-    // use the method restClient.GetCalendarAsync() to get the open time and schedule execution
-    // of your code based on that. However, this algorithm does not start trading until at least
-    // 20 minutes after the market opens.
-    private async Task AwaitMarketOpen()
+    private void dispose(bool disposing)
     {
-        while (!(await alpacaTradingClient.GetClockAsync()).IsOpen)
+        if (disposing)
         {
-            await Task.Delay(60000);
+            alpacaTradingClient?.Dispose();
+            alpacaCryptoDataClient?.Dispose();
+            alpacaStreamingClient?.Dispose();
+            alpacaCryptoStreamingClient?.Dispose();
         }
     }
 
-    // Determine whether our position should grow or shrink and submit orders.
-    private async Task HandleMinuteBar(IBar agg)
+    private async Task awaitMarketOpen(CancellationToken cancellationToken)
     {
+        try
+        {
+            while (!(await alpacaTradingClient.GetClockAsync(cancellationToken)).IsOpen)
+            {
+                await Task.Delay(60000, cancellationToken);
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            logger.LogInformation("Market open wait canceled.");
+        }
+        catch (AlpacaRestException ex)
+        {
+            logger.LogError(ex, "Alpaca REST API error occurred while waiting for the market to open.");
+        }
+        catch (Exception ex)
+        {
+            logger.LogError(ex, "An unexpected error occurred while waiting for the market to open.");
+        }
+    }
+
+    private async Task handleMinuteBar(IBar agg, string symbol, CancellationToken cancellationToken)
+    {
+        try
+        {
+            logger.LogInformation("Attempting to acquire file mutex for reading closing prices.");
+            fileMutex.WaitOne();
+            logger.LogInformation("File mutex acquired for reading closing prices.");
+
+            if (File.Exists(closingPricesFilePath))
+            {
+                logger.LogInformation("Reading closing prices from file.");
+                var json = await File.ReadAllTextAsync(closingPricesFilePath, cancellationToken);
+                var savedPrices = JsonSerializer.Deserialize(json, MeanReversionWithCryptoJsonContext.Default.ListDecimal);
+                if (savedPrices != null && savedPrices.All(price => price >= 0))
+                {
+                    closingPrices.AddRange(savedPrices);
+                    logger.LogInformation("Closing prices successfully read from file.");
+                }
+                else
+                {
+                    logger.LogError("Invalid data found in closing prices file.");
+                }
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            logger.LogInformation("Reading closing prices canceled.");
+        }
+        catch (Exception ex)
+        {
+            logger.LogError(ex, "Error loading closing prices from file. Using default empty list.");
+            closingPrices.Clear();
+        }
+        finally
+        {
+            fileMutex.ReleaseMutex();
+            logger.LogInformation("File mutex released after reading closing prices.");
+        }
+
         closingPrices.Add(agg.Close);
         if (closingPrices.Count <= 20)
         {
@@ -148,51 +279,101 @@ internal sealed class MeanReversionWithCrypto : IDisposable
 
         closingPrices.RemoveAt(0);
 
+        int writeAttempts = 0;
+        bool writeSuccessful = false;
+        while (writeAttempts < maxRetryAttempts && !writeSuccessful)
+        {
+            try
+            {
+                logger.LogInformation("Attempting to acquire file mutex for writing closing prices.");
+                fileMutex.WaitOne();
+                logger.LogInformation("File mutex acquired for writing closing prices.");
+
+                var json = JsonSerializer.Serialize(closingPrices, MeanReversionWithCryptoJsonContext.Default.ListDecimal);
+                await File.WriteAllTextAsync(closingPricesFilePath, json, cancellationToken);
+                logger.LogInformation("Closing prices successfully written to file.");
+                writeSuccessful = true;
+            }
+            catch (OperationCanceledException)
+            {
+                logger.LogInformation("Writing closing prices canceled.");
+                break;
+            }
+            catch (Exception ex)
+            {
+                writeAttempts++;
+                logger.LogError(ex, $"Error saving closing prices to file. Attempt {writeAttempts} of {maxRetryAttempts}.");
+                if (writeAttempts >= maxRetryAttempts)
+                {
+                    logger.LogError("Max retry attempts reached. Unable to save closing prices to file.");
+                }
+                await Task.Delay(initialDelay, cancellationToken);
+            }
+            finally
+            {
+                fileMutex.ReleaseMutex();
+                logger.LogInformation("File mutex released after writing closing prices.");
+            }
+        }
+
         var avg = closingPrices.Average();
         var diff = avg - agg.Close;
 
-        // If the last trade hasn't filled yet, we'd rather replace
-        // it than have two orders open at once.
         if (lastTradeOpen)
         {
-            // We need to wait for the cancel to process in order to avoid
-            // having long and short orders open at the same time.
-            var res = await alpacaTradingClient.CancelOrderAsync(lastTradeId);
+            try
+            {
+                await alpacaTradingClient.CancelOrderAsync(lastTradeId, cancellationToken);
+            }
+            catch (OperationCanceledException)
+            {
+                logger.LogInformation("Canceling last trade order canceled.");
+            }
+            catch (AlpacaRestException ex)
+            {
+                logger.LogError(ex, "Alpaca REST API error occurred while canceling the last trade order.");
+            }
+            catch (Exception ex)
+            {
+                logger.LogError(ex, "An unexpected error occurred while canceling the last trade order.");
+            }
         }
 
-        // Make sure we know how much we should spend on our position.
-        var account = await alpacaTradingClient.GetAccountAsync();
-        // Use maximum 10% of total account buying power for single trade
+        var account = await alpacaTradingClient.GetAccountAsync(cancellationToken);
         var buyingPower = account.BuyingPower * 0.10M ?? 0M;
         var equity = account.Equity;
         var multiplier = (Int64)account.Multiplier;
 
-        // Check how much we currently have in this position.
         var positionQuantity = 0L;
         var positionValue = 0M;
         try
         {
-            var currentPosition = await alpacaTradingClient.GetPositionAsync(symbol);
+            var currentPosition = await alpacaTradingClient.GetPositionAsync(symbol, cancellationToken);
             positionQuantity = currentPosition.IntegerQuantity;
             positionValue = currentPosition.MarketValue ?? 0M;
         }
-        catch (Exception) //-V3163 //-V5606
+        catch (OperationCanceledException)
         {
-            // No position exists. This exception can be safely ignored.
+            logger.LogInformation("Getting current position canceled.");
+        }
+        catch (AlpacaRestException ex)
+        {
+            logger.LogError(ex, "Alpaca REST API error occurred while getting the current position.");
+        }
+        catch (Exception ex)
+        {
+            logger.LogError(ex, "An unexpected error occurred while getting the current position.");
         }
 
         if (diff <= 0)
         {
-            // Price is above average: we want to short.
             if (positionQuantity > 0)
             {
-                // There is an existing long position we need to dispose of first
                 Console.WriteLine($"Removing {positionValue:C2} long position.");
-                await SubmitOrder(positionQuantity, agg.Close, OrderSide.Sell);
+                await submitOrder(positionQuantity, agg.Close, OrderSide.Sell, symbol, cancellationToken);
             }
             else
             {
-                // Allocate a percent of portfolio to short position
                 var portfolioShare = -1 * diff / agg.Close * scale;
                 var targetPositionValue = -1 * equity * multiplier * portfolioShare;
                 var amountToShort = targetPositionValue - positionValue;
@@ -200,61 +381,51 @@ internal sealed class MeanReversionWithCrypto : IDisposable
                 switch (amountToShort)
                 {
                     case < 0:
+                        amountToShort *= -1;
+                        if (amountToShort > buyingPower)
                         {
-                            // We want to expand our existing short position.
-                            amountToShort *= -1;
-                            if (amountToShort > buyingPower)
-                            {
-                                amountToShort = buyingPower;
-                            }
-
-                            var qty = (Int64)(amountToShort / agg.Close);
-                            if (isAssetShortable)
-                            {
-                                Console.WriteLine($"Adding {qty * agg.Close:C2} to short position.");
-                                await SubmitOrder(qty, agg.Close, OrderSide.Sell);
-                            }
-                            else
-                            {
-                                Console.WriteLine("Unable to place short order - asset is not shortable.");
-                            }
-                            break;
+                            amountToShort = buyingPower;
                         }
+
+                        var qty = (Int64)(amountToShort / agg.Close);
+                        if (isAssetShortable)
+                        {
+                            Console.WriteLine($"Adding {qty * agg.Close:C2} to short position.");
+                            await submitOrder(qty, agg.Close, OrderSide.Sell, symbol, cancellationToken);
+                        }
+                        else
+                        {
+                            Console.WriteLine("Unable to place short order - asset is not shortable.");
+                        }
+                        break;
 
                     case > 0:
+                        qty = (Int64)(amountToShort / agg.Close);
+                        if (qty > -1 * positionQuantity)
                         {
-                            // We want to shrink our existing short position.
-                            var qty = (Int64)(amountToShort / agg.Close);
-                            if (qty > -1 * positionQuantity)
-                            {
-                                qty = -1 * positionQuantity;
-                            }
-
-                            Console.WriteLine($"Removing {qty * agg.Close:C2} from short position");
-                            await SubmitOrder(qty, agg.Close, OrderSide.Buy);
-                            break;
+                            qty = -1 * positionQuantity;
                         }
+
+                        Console.WriteLine($"Removing {qty * agg.Close:C2} from short position");
+                        await submitOrder(qty, agg.Close, OrderSide.Buy, symbol, cancellationToken);
+                        break;
                 }
             }
         }
         else
         {
-            // Allocate a percent of our portfolio to long position.
             var portfolioShare = diff / agg.Close * scale;
             var targetPositionValue = equity * multiplier * portfolioShare;
             var amountToLong = targetPositionValue - positionValue;
 
             if (positionQuantity < 0)
             {
-                // There is an existing short position we need to dispose of first
                 Console.WriteLine($"Removing {positionValue:C2} short position.");
-                await SubmitOrder(-positionQuantity, agg.Close, OrderSide.Buy);
+                await submitOrder(-positionQuantity, agg.Close, OrderSide.Buy, symbol, cancellationToken);
             }
             else switch (amountToLong)
             {
                 case > 0:
-                {
-                    // We want to expand our existing long position.
                     if (amountToLong > buyingPower)
                     {
                         amountToLong = buyingPower;
@@ -262,24 +433,21 @@ internal sealed class MeanReversionWithCrypto : IDisposable
 
                     var qty = (Int32)(amountToLong / agg.Close);
 
-                    await SubmitOrder(qty, agg.Close, OrderSide.Buy);
+                    await submitOrder(qty, agg.Close, OrderSide.Buy, symbol, cancellationToken);
                     Console.WriteLine($"Adding {qty * agg.Close:C2} to long position.");
                     break;
-                }
 
                 case < 0:
-                {
-                    // We want to shrink our existing long position.
                     amountToLong *= -1;
-                    var qty = (Int64)(amountToLong / agg.Close);
+                    qty = (Int32)(amountToLong / agg.Close);
                     if (qty > positionQuantity)
                     {
-                        qty = positionQuantity;
+                        qty = (Int32)positionQuantity;
                     }
 
                     if (isAssetShortable)
                     {
-                        await SubmitOrder(qty, agg.Close, OrderSide.Sell);
+                        await submitOrder(qty, agg.Close, OrderSide.Sell, symbol, cancellationToken);
                         Console.WriteLine($"Removing {qty * agg.Close:C2} from long position");
                     }
                     else
@@ -287,22 +455,17 @@ internal sealed class MeanReversionWithCrypto : IDisposable
                         Console.WriteLine("Unable to place short order - asset is not shortable.");
                     }
                     break;
-                }
             }
         }
     }
 
-    // Update our information about the last order we placed.
-    // This is done so that we know whether or not we need to submit a cancel for
-    // that order before we place another.
-    private void HandleTradeUpdate(ITradeUpdate trade)
+    private void handleTradeUpdate(ITradeUpdate trade)
     {
         if (trade.Order.OrderId != lastTradeId)
         {
             return;
         }
 
-        // ReSharper disable once SwitchStatementMissingSomeEnumCasesNoDefault
         switch (trade.Event)
         {
             case TradeEvent.Fill:
@@ -320,8 +483,7 @@ internal sealed class MeanReversionWithCrypto : IDisposable
         }
     }
 
-    // Submit an order if quantity is not zero.
-    private async Task SubmitOrder(Int64 quantity, Decimal price, OrderSide side)
+    private async Task submitOrder(Int64 quantity, Decimal price, OrderSide side, string symbol, CancellationToken cancellationToken)
     {
         if (quantity == 0)
         {
@@ -330,37 +492,56 @@ internal sealed class MeanReversionWithCrypto : IDisposable
         try
         {
             var order = await alpacaTradingClient.PostOrderAsync(
-                side.Limit(symbol, quantity, price));
+                side.Limit(symbol, quantity, price), cancellationToken);
 
             lastTradeId = order.OrderId;
             lastTradeOpen = true;
         }
+        catch (OperationCanceledException)
+        {
+            logger.LogInformation("Submitting order canceled.");
+        }
+        catch (AlpacaRestException ex)
+        {
+            logger.LogError(ex, "Alpaca REST API error occurred while submitting an order.");
+        }
         catch (Exception e)
         {
-            Console.WriteLine("Warning: " + e.Message); //-V5621
+            logger.LogError(e, "An unexpected error occurred while submitting an order.");
         }
     }
 
-    private async Task ClosePositionAtMarket()
+    private async Task closePositionAtMarket(CancellationToken cancellationToken)
     {
-        try
+        foreach (var symbol in symbols)
         {
-            var positionQuantity = (await alpacaTradingClient.GetPositionAsync(symbol)).IntegerQuantity;
-            Console.WriteLine("Closing position at market price.");
-            if (positionQuantity > 0)
+            try
             {
-                await alpacaTradingClient.PostOrderAsync(
-                    OrderSide.Sell.Market(symbol, positionQuantity));
+                var positionQuantity = (await alpacaTradingClient.GetPositionAsync(symbol, cancellationToken)).IntegerQuantity;
+                Console.WriteLine("Closing position at market price.");
+                if (positionQuantity > 0)
+                {
+                    await alpacaTradingClient.PostOrderAsync(
+                        OrderSide.Sell.Market(symbol, positionQuantity), cancellationToken);
+                }
+                else
+                {
+                    await alpacaTradingClient.PostOrderAsync(
+                        OrderSide.Buy.Market(symbol, Math.Abs(positionQuantity)), cancellationToken);
+                }
             }
-            else
+            catch (OperationCanceledException)
             {
-                await alpacaTradingClient.PostOrderAsync(
-                    OrderSide.Buy.Market(symbol, Math.Abs(positionQuantity)));
+                logger.LogInformation("Closing position at market canceled.");
             }
-        }
-        catch (Exception) //-V3163 //-V5606
-        {
-            // No position to exit.
+            catch (AlpacaRestException ex)
+            {
+                logger.LogError(ex, "Alpaca REST API error occurred while closing the position at market.");
+            }
+            catch (Exception ex)
+            {
+                logger.LogError(ex, "An unexpected error occurred while closing the position at market.");
+            }
         }
     }
 }
